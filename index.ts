@@ -1,9 +1,9 @@
-import { constants, readFileSync } from "node:fs";
-import { access as fsAccess, readFile as fsReadFile } from "node:fs/promises";
+import { constants, mkdirSync, readFileSync } from "node:fs";
+import { access as fsAccess, mkdir as fsMkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { ExtensionAPI, BuildSystemPromptOptions } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, BuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool,
   createEditTool,
@@ -17,7 +17,8 @@ import {
 
 interface SshConnection {
   remote: string;
-  port: number;
+  /** Explicit port from --ssh-port; null = honor ~/.ssh config / ssh default. */
+  port: number | null;
   remoteCwd: string;
   remoteHome: string;
   localCwd: string;
@@ -159,6 +160,18 @@ function isLocalTempFilePath(path: string): boolean {
   return path === tmpdir() || path.startsWith(`${tmpdir()}/`);
 }
 
+/**
+ * pi/skills configuration paths are NEVER mapped to the remote host: the
+ * system prompt advertises the LOCAL skill/config content, so reads resolve
+ * locally (justcyl's "keep pi config paths local"). Shell commands are
+ * deliberately not protected - the execution view stays remote.
+ */
+function isProtectedLocalPath(absolutePath: string): boolean {
+  const home = homedir();
+  const dirs = [join(home, ".pi"), join(home, ".config", "pi"), join(home, ".agents")];
+  return dirs.some((dir) => absolutePath === dir || absolutePath.startsWith(`${dir}/`));
+}
+
 function mapLocalPathToRemote(path: string, conn: SshConnection): string {
   if (path === conn.localCwd) return conn.remoteCwd;
   if (path.startsWith(`${conn.localCwd}/`)) {
@@ -222,16 +235,29 @@ function parseSshPort(raw: string | undefined): number {
   return parsed;
 }
 
-function buildSshBaseArgs(port: number): string[] {
-  return [
-    "-p",
-    String(port),
+// Per-user, 0700 control-socket directory: /tmp control paths are predictable
+// and world-writable, letting any local user pre-place a socket (pansapiens).
+const CONTROL_SOCKET_DIR = join(homedir(), ".cache", "pi-ssh");
+try {
+  mkdirSync(CONTROL_SOCKET_DIR, { recursive: true, mode: 0o700 });
+} catch {
+  /* best effort - ssh reports a usable-path error itself */
+}
+
+function buildSshBaseArgs(port: number | null): string[] {
+  const args: string[] = [];
+  // null = let ~/.ssh/config / the ssh default decide (IA386, justcyl):
+  // forcing -p 22 overrides a configured "Port 2222".
+  if (port !== null) {
+    args.push("-p", String(port));
+  }
+  args.push(
     "-o",
     "ControlMaster=auto",
     "-o",
     "ControlPersist=600",
     "-o",
-    "ControlPath=/tmp/pi-ssh-%C",
+    `ControlPath=${join(CONTROL_SOCKET_DIR, "cm-%C")}`,
     // Keep the master alive through NAT/firewall idle timeouts and detect dead
     // peers instead of hanging tool calls on a silently dropped connection.
     "-o",
@@ -242,7 +268,15 @@ function buildSshBaseArgs(port: number): string[] {
     // fold on slow links for negligible CPU. Only applies to the master.
     "-o",
     "Compression=yes",
-  ];
+    // pansapiens: accept new host keys automatically (TOFU) but refuse changed
+    // keys (MITM); BatchMode prevents a piped, non-interactive password prompt
+    // from hanging tool calls.
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "BatchMode=yes",
+  );
+  return args;
 }
 
 function buildResolveRemotePathCommand(remotePath: string): string {
@@ -257,7 +291,7 @@ function buildResolveRemotePathCommand(remotePath: string): string {
 
 async function sshCapture(
   remote: string,
-  port: number,
+  port: number | null,
   remoteCommand: string,
   options: SshCaptureOptions = {},
 ): Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null; timedOut: boolean }> {
@@ -314,7 +348,7 @@ async function sshCapture(
   });
 }
 
-async function sshExec(remote: string, port: number, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
+async function sshExec(remote: string, port: number | null, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
   const result = await sshCapture(remote, port, remoteCommand, options);
   if (result.timedOut) {
     throw new Error(`SSH command timed out after ${options.timeoutSeconds ?? 0}s`);
@@ -961,14 +995,14 @@ function createRemoteReadOps(conn: SshConnection, transport: RemoteTransport): R
       // The built-in bash tool saves truncated full output to a LOCAL temp file
       // and hands the path to the model. Those files only exist on this machine,
       // so read them locally instead of over SSH.
-      if (isLocalTempFilePath(absolutePath)) {
+      if (isLocalTempFilePath(absolutePath) || isProtectedLocalPath(absolutePath)) {
         return fsReadFile(absolutePath);
       }
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
       return transport.readFile(remotePath);
     },
     access: async (absolutePath) => {
-      if (isLocalTempFilePath(absolutePath)) {
+      if (isLocalTempFilePath(absolutePath) || isProtectedLocalPath(absolutePath)) {
         await fsAccess(absolutePath, constants.R_OK);
         return;
       }
@@ -993,10 +1027,18 @@ function createRemoteReadOps(conn: SshConnection, transport: RemoteTransport): R
 function createRemoteWriteOps(conn: SshConnection, transport: RemoteTransport): WriteOperations {
   return {
     mkdir: async (absoluteDir) => {
+      if (isProtectedLocalPath(absoluteDir)) {
+        await fsMkdir(absoluteDir, { recursive: true });
+        return;
+      }
       const remoteDir = mapLocalPathToRemote(absoluteDir, conn);
       await transport.mkdir(remoteDir);
     },
     writeFile: async (absolutePath, content) => {
+      if (isProtectedLocalPath(absolutePath)) {
+        await fsWriteFile(absolutePath, content);
+        return;
+      }
       const remotePath = mapLocalPathToRemote(absolutePath, conn);
       await transport.writeFile(remotePath, Buffer.from(content, "utf-8"));
     },
@@ -1025,7 +1067,7 @@ function createRemoteBashOps(transport: RemoteTransport): BashOperations {
   };
 }
 
-async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number): Promise<SshConnection> {
+async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number | null): Promise<SshConnection> {
   const parsed = parseSshFlag(rawFlag);
 
   // Single round trip: detect HOME and resolve the remote workspace together.
@@ -1126,14 +1168,17 @@ export function findStoredConnection(sessionManager: SessionManagerLike): SshCon
       return null;
     }
 
-    // An invalid stored port means the record is corrupt: refuse to reconnect
-    // rather than guessing (e.g. silently falling back to port 22 could hit the
-    // wrong service). The session stays local.
-    let port: number;
-    try {
-      port = parseSshPort(String(data.port ?? "22"));
-    } catch {
-      return null;
+    // Old records always stored a concrete port (22 was force-applied); treat
+    // a stored 22 as "no explicit port" so ~/.ssh/config Port directives win.
+    let port: number | null;
+    if (data.port === null || data.port === undefined || Number(data.port) === 22) {
+      port = null;
+    } else {
+      try {
+        port = parseSshPort(String(data.port));
+      } catch {
+        return null;
+      }
     }
 
     // Rebuild with the CURRENT local cwd/home: tools resolve relative paths
@@ -1231,9 +1276,8 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     type: "string",
   });
   pi.registerFlag("ssh-port", {
-    description: "SSH port (default: 22)",
+    description: "SSH port (default: honor ~/.ssh/config / ssh default)",
     type: "string",
-    default: "22",
   });
   pi.registerFlag("p", {
     description: "Alias for --ssh-port",
@@ -1272,6 +1316,14 @@ export default function piSshExtension(pi: ExtensionAPI): void {
 
   const getConnection = () => connection ?? getGlobal()?.connection ?? null;
   const getTransport = () => transport ?? getGlobal()?.transport ?? null;
+
+  // Tool overrides are registered lazily (danyx23): a pure-local session keeps
+  // pi's built-in read/write/edit/bash untouched. Registered once, on the first
+  // successful connect (including sub-agent inheritance).
+  let toolsRegistered = false;
+  const ensureToolsRegistered = () => {
+    if (toolsRegistered) return;
+    toolsRegistered = true;
 
   pi.registerTool({
     ...localRead,
@@ -1323,6 +1375,9 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       return tool.execute(id, params, signal, onUpdate);
     },
   });
+  };
+  const ensureToolsRegisteredRef = ensureToolsRegistered;
+  void ensureToolsRegisteredRef;
 
   const statusLine = (conn: SshConnection) =>
     `SSH ${conn.remote}:${conn.remoteCwd} (port ${conn.port ?? "ssh-config"})`;
@@ -1355,6 +1410,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     connection = conn;
     transport = new SshTransport(conn);
     ownsTransport = true;
+    ensureToolsRegistered();
     setGlobal({ connection: conn, transport });
     // (Re)record the connection so future resumes reconnect. Latest entry wins.
     pi.appendEntry(CONNECTION_ENTRY_TYPE, conn);
@@ -1401,11 +1457,11 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     remoteContext = null;
 
     const flag = pi.getFlag("ssh") as string | undefined;
-    const rawPort = (pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined);
+    const portFlag = (pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined);
+    const port = portFlag !== undefined ? parseSshPort(portFlag) : null;
 
     try {
       if (flag) {
-        const port = parseSshPort(rawPort);
         await activateConnection(await resolveSshConnection(flag, localCwd, localHome, port), ctx, "enabled");
       } else {
         // No --ssh flag: reconnect from the connection record stored in the
@@ -1421,6 +1477,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
           if (g) {
             connection = g.connection;
             transport = g.transport;
+            ensureToolsRegistered();
             console.log(`pi-ssh inherited for sub-agent: ${g.connection.remote}:${g.connection.remoteCwd}`);
           }
         }
@@ -1578,7 +1635,8 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       }
 
       try {
-        const port = parseSshPort((pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined));
+        const portFlag = (pi.getFlag("p") as string | undefined) ?? (pi.getFlag("ssh-port") as string | undefined);
+        const port = portFlag !== undefined ? parseSshPort(portFlag) : null;
         await activateConnection(await resolveSshConnection(target, localCwd, localHome, port), ctx, "connected");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
