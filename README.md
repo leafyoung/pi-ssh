@@ -32,7 +32,16 @@ This is useful when:
   - Ctrl-C interrupts the current remote command but keeps the SSH session alive
 - Remote execution for user `!` commands
 - Status indicator in the pi UI when SSH mode is active
-- System prompt cwd rewrite to reflect remote cwd
+- System prompt cwd rewrite: the `<cwd>` prompt section shows the remote cwd, so the model works remotely from the first turn
+- Session persistence: the connection is recorded in the session file, so `pi -r` / resume reconnects automatically without re-typing `--ssh`
+- Local paths inside bash commands (and local temp-file paths from truncated output) are transparently mapped/redirected
+- `/ssh [user@host[:/path] | status | off]` command to connect, switch, or disconnect mid-session (completions from `~/.ssh/config`)
+- Reliable aborts: each payload runs in its own process group (`setsid -w`, or perl's `POSIX::setsid` on macOS); Esc/Ctrl-C kills the tree over a one-shot SSH instead of relying on the TTY (which interactive line editors like zsh's ZLE swallow)
+- Shell-readiness handshake so the first command can't race remote shell startup
+- Remote `AGENTS.md` / `CLAUDE.md` from the remote cwd are surfaced to the model as a `<ssh_context>` prompt section
+- `@` file completion completes against the remote workspace (pi's `@` inserts a path; the read tool fetches it remotely)
+- pi-subagents interop: sub-agent sessions inherit the parent's SSH connection automatically
+- `HISTFILE=/dev/null` on the remote shell: no `.bash_history` pollution
 
 ## Requirements
 
@@ -84,6 +93,20 @@ You should see a status line similar to:
 ```text
 SSH user@my-vm:/home/user/chromium/src (port 22)
 ```
+
+## Session persistence / resume
+
+When a connection is established, pi-ssh writes a `pi-ssh-connection` record into the session file (a custom entry, not sent to the LLM). When you later resume that session without `--ssh`, the extension reconnects to the recorded target automatically:
+
+```bash
+pi --ssh user@my-vm:/work/src   # first time: connects and records
+pi -r                           # later: resumes and reconnects to user@my-vm:/work/src
+```
+
+- An explicit `--ssh` flag always wins over the stored record.
+- If the stored host is unreachable at resume time, the session still opens (in local mode) with an error notification.
+- `/new` starts a fresh session with no record, so it does not silently reconnect; forks inherit the record from the branch.
+- The record contains host, port, and paths only — authentication stays with your local SSH agent/keys.
 
 ## Typical workflow
 
