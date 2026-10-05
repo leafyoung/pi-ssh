@@ -1,5 +1,5 @@
 import { constants, mkdirSync, readFileSync } from "node:fs";
-import { access as fsAccess, mkdir as fsMkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
+import { access as fsAccess, mkdir as fsMkdir, readFile as fsReadFile, unlink as fsUnlink, writeFile as fsWriteFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -204,13 +204,42 @@ function findRemotePathSeparator(value: string): number {
   return -1;
 }
 
-function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
+/**
+ * Windows-aware scan (furkan-bilgin): `user@host:C:\Users\me` has two colons
+ * (host separator + drive letter) - lastIndexOf would pick the drive colon.
+ * Scan left-to-right and skip drive-letter pseudo-splits.
+ */
+function findWindowsAwarePathSeparator(value: string): number {
+  for (let i = 0; i < value.length; i++) {
+    if (value[i] !== ":") continue;
+    const before = value.slice(0, i).trim();
+    const remotePath = value.slice(i + 1).trim();
+    // Drive letter with separator or drive-relative: not the host separator.
+    if (before.length === 1 && /^[A-Za-z]$/.test(before)) continue;
+    if (/^[A-Za-z]:/.test(remotePath) && before.includes("@") === false && before.length > 0 && value.indexOf(":", i + 1) !== -1) {
+      // A later colon may still be the real separator; keep scanning.
+      continue;
+    }
+    if (
+      remotePath.startsWith("/") ||
+      remotePath.startsWith("\\") ||
+      remotePath === "~" ||
+      remotePath.startsWith("~/") ||
+      /^[A-Za-z]:[\\/]/.test(remotePath)
+    ) {
+      return i;
+    }
+  }
+  return findRemotePathSeparator(value);
+}
+
+export function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
   const value = raw.trim();
   if (!value) {
     throw new Error("--ssh requires a value like user@host or user@host:/remote/path");
   }
 
-  const colonIndex = findRemotePathSeparator(value);
+  const colonIndex = findWindowsAwarePathSeparator(value);
   if (colonIndex === -1) {
     return { remote: value };
   }
@@ -279,14 +308,23 @@ function buildSshBaseArgs(port: number | null): string[] {
   return args;
 }
 
+function looksLikeWindowsPath(remotePath: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(remotePath) || remotePath.startsWith("\\");
+}
+
 function buildResolveRemotePathCommand(remotePath: string): string {
+  // Windows remote (cmd.exe): cd /d switches drives too. POSIX form first so
+  // the combined probe works before the platform is known.
+  if (looksLikeWindowsPath(remotePath)) {
+    return `cd /d "${remotePath.replace(/\//g, "\\")}" && cd`;
+  }
   if (remotePath === "~") {
     return 'cd -- "$HOME" && pwd';
   }
   if (remotePath.startsWith("~/")) {
     return `cd -- "$HOME"/${shellQuote(remotePath.slice(2))} && pwd`;
   }
-  return `cd -- ${shellQuote(remotePath)} && pwd`;
+  return `(cd -- ${shellQuote(remotePath)} 2>/dev/null && pwd) || (cd /d "${remotePath}" && cd)`;
 }
 
 async function sshCapture(
@@ -361,6 +399,25 @@ async function sshExec(remote: string, port: number | null, remoteCommand: strin
   return result.stdout;
 }
 
+// ---- Windows remote support (furkan-bilgin) ----
+// Windows OpenSSH always lands in cmd.exe interactively; there is no reliable
+// persistent shell. All Windows operations run as one-shot ssh execs whose
+// payload is a PowerShell -EncodedCommand (pure base64, cmd-safe). Aborts use
+// taskkill /F /T on a recorded PID (Windows orphans remote processes when the
+// local ssh client disconnects, so an active kill is required).
+
+function powershellEncoded(script: string): string {
+  return `powershell -NoProfile -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+}
+
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function windowsPidFile(unique: string): string {
+  return `%TEMP%\\pi-ssh-pid-${unique}.txt`;
+}
+
 // Default timeout (5 minutes) prevents a single hung command from blocking
 // the entire SSH command queue forever.
 const DEFAULT_EXEC_TIMEOUT_SECONDS = 300;
@@ -414,6 +471,9 @@ class PersistentRemoteShell {
   private async ensureStarted(): Promise<void> {
     if (this.disposed) {
       throw new Error("Remote shell is disposed");
+    }
+    if (this.connection.platform === "windows") {
+      throw new Error("No persistent shell on Windows remotes; use one-shot exec");
     }
     if (this.child && !this.child.killed) {
       return;
@@ -816,6 +876,9 @@ export class SshTransport implements RemoteTransport {
   }
 
   async warmup(): Promise<void> {
+    if (this.connection.platform === "windows") {
+      return; // no persistent shell on Windows
+    }
     await this.queue.enqueue(async () => {
       try {
         // Best-effort: open the persistent shell now so the first tool call
@@ -832,10 +895,88 @@ export class SshTransport implements RemoteTransport {
     cwd: string,
     options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number },
   ): Promise<{ exitCode: number | null }> {
+    if (this.connection.platform === "windows") {
+      return this.queue.enqueue(() => this.windowsExec(command, cwd, options));
+    }
     return this.queue.enqueue(() => this.shell.exec(command, cwd, options));
   }
 
+  /**
+   * Windows one-shot exec: PowerShell EncodedCommand so arbitrary command text
+   * (newlines, quotes) survives cmd.exe; the script records its own PID so
+   * abort/timeout can taskkill /F /T the whole tree.
+   */
+  private windowsExec(
+    command: string,
+    cwd: string,
+    options: { onData: (data: Buffer) => void; signal?: AbortSignal; timeout?: number },
+  ): Promise<{ exitCode: number | null }> {
+    const unique = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const pidFile = windowsPidFile(unique);
+    const remoteCwd = mapLocalPathToRemote(cwd, this.connection);
+    const script = [
+      `$pid | Set-Content -Path ${psQuote(pidFile)}`,
+      `Set-Location -LiteralPath ${psQuote(remoteCwd)}`,
+      command,
+    ].join("\n");
+    const remote = powershellEncoded(script);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+
+      const child = spawn("ssh", [...buildSshBaseArgs(this.connection.port), this.connection.remote, remote], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const stdoutChunks: Buffer[] = [];
+      child.stdout.on("data", (c) => options.onData(c));
+      child.stderr.on("data", (c) => options.onData(c));
+      child.on("error", (e) => finish(() => reject(e)));
+      child.on("close", (code) => finish(() => resolve({ exitCode: code })));
+
+      const killRemote = () => {
+        const kill = `for /f %i in ('type ${pidFile} 2^>nul') do taskkill /F /T /PID %i`;
+        sshCapture(this.connection.remote, this.connection.port, kill, { timeoutSeconds: 10 }).catch(() => {});
+        try {
+          child.kill();
+        } catch {
+          /* already gone */
+        }
+      };
+
+      const effectiveTimeout = options.timeout ?? DEFAULT_EXEC_TIMEOUT_SECONDS;
+      const timer =
+        effectiveTimeout > 0
+          ? setTimeout(() => {
+              killRemote();
+              finish(() => reject(new Error(`timeout:${effectiveTimeout}`)));
+            }, effectiveTimeout * 1000)
+          : undefined;
+
+      if (options.signal) {
+        const onAbort = () => {
+          killRemote();
+          finish(() => reject(new Error("aborted")));
+        };
+        if (options.signal.aborted) onAbort();
+        else options.signal.addEventListener("abort", onAbort, { once: true });
+        void timer;
+      }
+    });
+  }
+
   async readFile(remotePath: string): Promise<Buffer> {
+    if (this.connection.platform === "windows") {
+      const script = `[Convert]::ToBase64String([IO.File]::ReadAllBytes(${psQuote(remotePath)}))`;
+      const out = await sshExec(this.connection.remote, this.connection.port, powershellEncoded(script), {
+        timeoutSeconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+      });
+      return Buffer.from(out.toString("utf-8").trim(), "base64");
+    }
     const quotedPath = shellQuote(remotePath);
     try {
       // Fast path: one round trip through the persistent shell, no ssh spawn.
@@ -853,6 +994,46 @@ export class SshTransport implements RemoteTransport {
         }),
       );
     }
+  }
+
+  private async windowsWriteFile(remotePath: string, content: Buffer): Promise<void> {
+    const dir = remoteDirname(remotePath);
+    await this.runCheckedWindows(powershellEncoded(`New-Item -ItemType Directory -Force -Path ${psQuote(dir)} | Out-Null`));
+    // Small payloads inline as base64 (argv limit ~32KB on Windows -> 8KB raw);
+    // larger ones stream via scp from a local temp file.
+    if (content.length <= 8 * 1024) {
+      const script = `[IO.File]::WriteAllBytes(${psQuote(remotePath)}, [Convert]::FromBase64String('${content.toString("base64")}'))`;
+      await this.runCheckedWindows(powershellEncoded(script));
+      return;
+    }
+    const tmp = join(tmpdir(), `pi-ssh-win-${Date.now()}.bin`);
+    await fsWriteFile(tmp, content);
+    try {
+      const scpArgs: string[] = [];
+      if (this.connection.port !== null) scpArgs.push("-P", String(this.connection.port));
+      scpArgs.push("-o", `ControlPath=${join(CONTROL_SOCKET_DIR, "cm-%C")}`, "-o", "StrictHostKeyChecking=accept-new");
+      scpArgs.push(tmp, `${this.connection.remote}:"${remotePath.replace(/\\/g, "/")}"`);
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn("scp", scpArgs, { stdio: ["pipe", "pipe", "pipe"] });
+        let err = "";
+        child.stderr.on("data", (c) => (err += c.toString()));
+        child.on("error", reject);
+        child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `scp exit ${code}`))));
+      });
+    } finally {
+      await fsUnlink(tmp).catch(() => {});
+    }
+  }
+
+  private async runCheckedWindows(remote: string): Promise<Buffer> {
+    const result = await sshCapture(this.connection.remote, this.connection.port, remote, {
+      timeoutSeconds: DEFAULT_EXEC_TIMEOUT_SECONDS,
+    });
+    if (result.exitCode !== 0) {
+      const stderr = result.stderr.toString("utf-8").trim();
+      throw new Error(stderr || `Windows command failed with exit code ${result.exitCode}`);
+    }
+    return result.stdout;
   }
 
   private async readViaPersistentShell(quotedPath: string): Promise<Buffer> {
@@ -910,14 +1091,26 @@ export class SshTransport implements RemoteTransport {
   }
 
   async ensureReadable(remotePath: string): Promise<void> {
+    if (this.connection.platform === "windows") {
+      await this.runCheckedWindows(powershellEncoded(`if (-not (Test-Path -Path ${psQuote(remotePath)})) { exit 1 }`));
+      return;
+    }
     await this.runChecked(`test -r ${shellQuote(remotePath)}`);
   }
 
   async ensureReadableWritable(remotePath: string): Promise<void> {
+    if (this.connection.platform === "windows") {
+      // Windows OpenSSH has no POSIX permission checks; existence is the bar.
+      await this.ensureReadable(remotePath);
+      return;
+    }
     await this.runChecked(`test -r ${shellQuote(remotePath)} && test -w ${shellQuote(remotePath)}`);
   }
 
   async detectImageMimeType(remotePath: string): Promise<string | null> {
+    if (this.connection.platform === "windows") {
+      return null; // no `file` utility on Windows remotes (furkan-bilgin)
+    }
     const result = await this.capture(`file --mime-type -b -- ${shellQuote(remotePath)} 2>/dev/null || true`);
     const mime = result.output.toString("utf-8").trim();
     if (["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mime)) {
@@ -927,10 +1120,18 @@ export class SshTransport implements RemoteTransport {
   }
 
   async mkdir(remoteDir: string): Promise<void> {
+    if (this.connection.platform === "windows") {
+      await this.runCheckedWindows(powershellEncoded(`New-Item -ItemType Directory -Force -Path ${psQuote(remoteDir)} | Out-Null`));
+      return;
+    }
     await this.runChecked(`mkdir -p -- ${shellQuote(remoteDir)}`);
   }
 
   async writeFile(remotePath: string, content: Buffer): Promise<void> {
+    if (this.connection.platform === "windows") {
+      await this.windowsWriteFile(remotePath, content);
+      return;
+    }
     if (content.length <= PERSISTENT_WRITE_MAX_BYTES) {
       const remoteDir = remoteDirname(remotePath);
       const encodedContent = content.toString("base64");
@@ -1082,7 +1283,7 @@ async function resolveSshConnection(rawFlag: string, localCwd: string, localHome
     // then the wrapper returns before the payload even starts.
     "command -v setsid >/dev/null 2>&1 && setsid -w true 2>/dev/null && echo setsid || { command -v perl >/dev/null 2>&1 && echo perl; } || echo single",
     'uname -s 2>/dev/null || echo %OS%',
-    parsed.remotePath ? buildResolveRemotePathCommand(parsed.remotePath) : "pwd",
+    parsed.remotePath ? buildResolveRemotePathCommand(parsed.remotePath) : 'pwd 2>/dev/null || echo %CD%',
   ].join("; ");
   const probeResult = await sshExec(parsed.remote, port, probe, { timeoutSeconds: 15 });
   const [homeLine, setsidLine, unameLine, cwdLine] = probeResult.toString("utf-8").split("\n");

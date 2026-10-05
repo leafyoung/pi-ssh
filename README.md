@@ -115,6 +115,24 @@ pi -r                           # later: resumes and reconnects to user@my-vm:/w
 3. All tool operations run remotely
 4. Keep local model switching, auth, and limits as usual
 
+## Windows remotes
+
+Windows hosts are supported (after furkan-bilgin's fork): pi-ssh detects the
+platform during the startup probe (`uname -s` fails, `%OS%` echoes) and then
+
+- runs every operation as a one-shot `ssh` exec with a PowerShell
+  `-EncodedCommand` payload (no persistent shell - Windows OpenSSH always
+  lands in an interactive cmd.exe),
+- aborts with `taskkill /F /T /PID`: the payload records its own PID, because
+  Windows OpenSSH orphans remote processes when the local client disconnects,
+- reads files via PowerShell base64, writes small files inline and larger
+  ones via `scp` from a local temp file,
+- parses Windows targets correctly: `--ssh user@host:C:\Users\me` (the drive
+  colon is not mistaken for the host separator).
+
+Image mime detection returns null (no `file` utility). Not exercised in CI;
+report issues against the Windows paths specifically.
+
 ## Notes
 
 - Absolute paths are strongly recommended for the remote path.
