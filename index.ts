@@ -510,6 +510,10 @@ class PersistentRemoteShell {
     this.child.stdin.write(
       "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
         "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; export HISTFILE=/dev/null; " +
+        // Stray SIGINT must never kill the interactive shell itself. bash
+        // resets an inherited ignored-INT disposition for its children, so
+        // payload trees stay INT-killable despite this trap (verified live).
+        "trap '' INT 2>/dev/null || true; " +
         "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
         "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
     );
@@ -693,10 +697,13 @@ class PersistentRemoteShell {
     // would hang forever. External kills don't trigger the line-abandon.)
     if (running.pidFile) {
       const qpid = shellQuote(running.pidFile);
+      // TERM, not INT: the shell traps '' INT (stray-TTY protection) and an
+      // ignored INT disposition is inherited by payloads, which would make a
+      // group INT a no-op. TERM disposition is untouched by the trap.
       const killCommand =
         this.connection.abortMode === "single"
-          ? `kill -INT "$(cat ${qpid} 2>/dev/null)" 2>/dev/null; rm -f ${qpid}`
-          : `kill -INT -- "-$(cat ${qpid} 2>/dev/null)" 2>/dev/null; rm -f ${qpid}`;
+          ? `kill -TERM "$(cat ${qpid} 2>/dev/null)" 2>/dev/null; rm -f ${qpid}`
+          : `kill -TERM -- "-$(cat ${qpid} 2>/dev/null)" 2>/dev/null; rm -f ${qpid}`;
       // Fire-and-forget: the real or injected END marker completes the command.
       sshCapture(this.connection.remote, this.connection.port, killCommand, { timeoutSeconds: 10 }).catch(() => {});
     }
