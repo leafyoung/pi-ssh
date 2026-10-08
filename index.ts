@@ -1352,8 +1352,10 @@ const CONNECTION_ENTRY_TYPE = "pi-ssh-connection";
  * Pick a unique session display name for the remote target: "<remote>:<remoteCwd>".
  * When another stored session already uses the base name, append ":NN" with NN one
  * past the highest serial already taken among its numbered variants (base, base:1,
- * base:2, ...). Falls back to the base name if existing sessions can't be listed —
- * a duplicate name is cosmetic, a failed connect is not.
+ * base:2, ...). The scan is heuristic over display names — user-renamed sessions
+ * that happen to look like "<base>:<number>" count toward the serial. Falls back
+ * to the base name if existing sessions can't be listed — a duplicate name is
+ * cosmetic, a failed connect is not.
  */
 async function computeRemoteSessionName(remote: string, remoteCwd: string): Promise<string> {
   const base = `${remote}:${remoteCwd}`;
@@ -1654,21 +1656,26 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     setGlobal({ connection: conn, transport });
     // (Re)record the connection so future resumes reconnect. Latest entry wins.
     pi.appendEntry(CONNECTION_ENTRY_TYPE, conn);
+    // Open the persistent shell in the background so the first tool call
+    // doesn't pay connection setup. Remote context loads over the same shell.
+    void transport.warmup();
     // Name the session after the remote target so multiple remote sessions are
     // distinguishable in the session selector. Only when the session has no
     // name yet: session_start also fires on resume, and re-computing there
     // would find the session's own name "taken" and shift it to the next
     // serial. Never clobber a user-set name either.
+    //
+    // Fire-and-forget: computing the name lists every stored session, which
+    // must not delay warmup or the remote-context load. Two sessions started
+    // concurrently to the same target can race and pick the same name — the
+    // duplicate is cosmetic and the naming scan is heuristic anyway.
     if (!pi.getSessionName()) {
-      try {
-        pi.setSessionName(await computeRemoteSessionName(conn.remote, conn.remoteCwd));
-      } catch {
-        /* naming is best-effort */
-      }
+      void computeRemoteSessionName(conn.remote, conn.remoteCwd)
+        .then((name) => pi.setSessionName(name))
+        .catch(() => {
+          /* naming is best-effort */
+        });
     }
-    // Open the persistent shell in the background so the first tool call
-    // doesn't pay connection setup. Remote context loads over the same shell.
-    void transport.warmup();
     remoteContext = await loadRemoteContext(transport, conn);
 
     const message = `pi-ssh ${via}: ${conn.remote}:${conn.remoteCwd} (port ${conn.port ?? "ssh-config"})`;
