@@ -3,7 +3,7 @@ import { access as fsAccess, mkdir as fsMkdir, readFile as fsReadFile, unlink as
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { ExtensionAPI, BuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type BuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool,
   createEditTool,
@@ -1348,6 +1348,38 @@ function readSshConfigHosts(): string[] {
  */
 const CONNECTION_ENTRY_TYPE = "pi-ssh-connection";
 
+/**
+ * Pick a unique session display name for the remote target: "<remote>:<remoteCwd>".
+ * When another stored session already uses the base name, append ":NN" with NN one
+ * past the highest serial already taken among its numbered variants (base, base:1,
+ * base:2, ...). Falls back to the base name if existing sessions can't be listed —
+ * a duplicate name is cosmetic, a failed connect is not.
+ */
+async function computeRemoteSessionName(remote: string, remoteCwd: string): Promise<string> {
+  const base = `${remote}:${remoteCwd}`;
+  try {
+    const sessions = await SessionManager.listAll();
+    const names = sessions.map((session) => session.name).filter((name): name is string => Boolean(name));
+    if (!names.includes(base)) {
+      return base;
+    }
+    // Parse "<base>:<NN>" with string methods: remote paths can contain any
+    // character that would need escaping in a RegExp.
+    const numberedPrefix = `${base}:`;
+    let maxSerial = 0;
+    for (const name of names) {
+      if (!name.startsWith(numberedPrefix)) continue;
+      const serial = Number(name.slice(numberedPrefix.length));
+      if (Number.isInteger(serial) && serial > maxSerial) {
+        maxSerial = serial;
+      }
+    }
+    return `${numberedPrefix}${maxSerial + 1}`;
+  } catch {
+    return base;
+  }
+}
+
 interface SessionManagerLike {
   getBranch(): readonly unknown[];
 }
@@ -1622,6 +1654,18 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     setGlobal({ connection: conn, transport });
     // (Re)record the connection so future resumes reconnect. Latest entry wins.
     pi.appendEntry(CONNECTION_ENTRY_TYPE, conn);
+    // Name the session after the remote target so multiple remote sessions are
+    // distinguishable in the session selector. Only when the session has no
+    // name yet: session_start also fires on resume, and re-computing there
+    // would find the session's own name "taken" and shift it to the next
+    // serial. Never clobber a user-set name either.
+    if (!pi.getSessionName()) {
+      try {
+        pi.setSessionName(await computeRemoteSessionName(conn.remote, conn.remoteCwd));
+      } catch {
+        /* naming is best-effort */
+      }
+    }
     // Open the persistent shell in the background so the first tool call
     // doesn't pay connection setup. Remote context loads over the same shell.
     void transport.warmup();
